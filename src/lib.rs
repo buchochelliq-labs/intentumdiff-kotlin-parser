@@ -45,95 +45,215 @@ struct SourceLine {
     number: u32,
     text: String,
     trimmed: String,
+    /// `text` with comments and literals blanked: only structural code, at
+    /// the same byte offsets.  Used for brace matching.
+    code: String,
 }
 
-/// Replace every Kotlin comment (`// ...`, nested `/* ... */`, KDoc) with
-/// spaces so comments never reach semantic labels.  Newlines are kept and each
-/// masked character is replaced by as many spaces as its UTF-8 length, so rows
-/// and byte columns are unchanged.  String literals (`"..."`, raw `"""..."""`)
-/// and character literals are skipped so `//`, `/*` inside them are retained.
-fn mask_comments(source: &str) -> String {
+/// Lexical class of a source byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteClass {
+    /// Executable code outside any literal.
+    Code,
+    /// Part of a comment (`// ...`, nested `/* ... */`, KDoc).
+    Comment,
+    /// Part of a string or character literal, including its delimiters and
+    /// any `${...}` template expression nested in it.
+    Literal,
+}
+
+/// One open lexical context on the scanner stack.
+#[derive(Debug, Clone, Copy)]
+enum Frame {
+    /// `"..."`: escapes and templates.
+    Str,
+    /// `"""..."""`: templates, no escapes, may span lines.
+    RawStr,
+    /// `${...}` inside a string; `depth` counts unmatched `{` in the expression.
+    Template { depth: usize },
+}
+
+/// Classify every byte of `source`.  The scanner keeps a stack of
+/// string/template contexts so a string literal nested in a template
+/// expression (`"a ${m["k"]} b"`), braces inside the expression
+/// (`"${xs.map { "}" }}"`), raw strings with templates and escapes (`\"`,
+/// `\$`) are all tracked; comment delimiters are recognised only in code
+/// (top level or inside a template expression).
+fn classify(source: &str) -> Vec<ByteClass> {
     let bytes = source.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut class = vec![ByteClass::Code; bytes.len()];
+    let mut stack: Vec<Frame> = Vec::new();
     let mut i = 0usize;
-    let blank = |out: &mut Vec<u8>, b: u8| {
-        if b == b'\n' || b == b'\r' {
-            out.push(b);
-        } else {
-            out.push(b' ');
+    let mark = |class: &mut [ByteClass], from: usize, to: usize, c: ByteClass| {
+        for slot in &mut class[from..to.min(bytes.len())] {
+            *slot = c;
         }
     };
     while i < bytes.len() {
         let b = bytes[i];
-        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
-                out.push(b' ');
-                i += 1;
-            }
-        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            let mut depth = 0usize;
-            while i < bytes.len() {
-                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-                    depth += 1;
-                    out.extend_from_slice(b"  ");
-                    i += 2;
-                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                    depth -= 1;
-                    out.extend_from_slice(b"  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
+        match stack.last().copied() {
+            None | Some(Frame::Template { .. }) => {
+                let here = if stack.is_empty() {
+                    ByteClass::Code
                 } else {
-                    blank(&mut out, bytes[i]);
+                    ByteClass::Literal
+                };
+                if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                    let from = i;
+                    while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                        i += 1;
+                    }
+                    mark(&mut class, from, i, ByteClass::Comment);
+                } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    let from = i;
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                            depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    mark(&mut class, from, i, ByteClass::Comment);
+                } else if bytes[i..].starts_with(b"\"\"\"") {
+                    stack.push(Frame::RawStr);
+                    mark(&mut class, i, i + 3, ByteClass::Literal);
+                    i += 3;
+                } else if b == b'"' {
+                    stack.push(Frame::Str);
+                    class[i] = ByteClass::Literal;
+                    i += 1;
+                } else if b == b'\'' {
+                    // Character literal: `'x'`, `'\''`, `'A'`, `'"'`.
+                    let from = i;
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        let c = bytes[i];
+                        i += 1;
+                        if c == b'\\' && i < bytes.len() && bytes[i] != b'\n' {
+                            i += 1;
+                        } else if c == b'\'' {
+                            break;
+                        }
+                    }
+                    mark(&mut class, from, i, ByteClass::Literal);
+                } else {
+                    class[i] = here;
+                    if let Some(Frame::Template { depth }) = stack.last_mut() {
+                        if b == b'{' {
+                            *depth += 1;
+                        } else if b == b'}' {
+                            if *depth == 0 {
+                                stack.pop();
+                            } else {
+                                *depth -= 1;
+                            }
+                        }
+                    }
                     i += 1;
                 }
             }
-        } else if bytes[i..].starts_with(b"\"\"\"") {
-            out.extend_from_slice(b"\"\"\"");
-            i += 3;
-            while i < bytes.len() && !bytes[i..].starts_with(b"\"\"\"") {
-                out.push(bytes[i]);
-                i += 1;
-            }
-            // Closing delimiter plus any extra trailing quotes belong to the literal.
-            while i < bytes.len() && bytes[i] == b'"' {
-                out.push(b'"');
-                i += 1;
-            }
-        } else if b == b'"' || b == b'\'' {
-            let quote = b;
-            out.push(b);
-            i += 1;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                let c = bytes[i];
-                out.push(c);
-                i += 1;
-                if c == b'\\' && i < bytes.len() && bytes[i] != b'\n' {
-                    out.push(bytes[i]);
+            Some(Frame::Str) => {
+                if b == b'\n' || b == b'\r' {
+                    // Unterminated single-line string: recover at the line end.
+                    stack.pop();
+                    continue;
+                }
+                class[i] = ByteClass::Literal;
+                if b == b'\\' && i + 1 < bytes.len() && bytes[i + 1] != b'\n' {
+                    let width = utf8_width(bytes[i + 1]);
+                    mark(&mut class, i, i + 1 + width, ByteClass::Literal);
+                    i += 1 + width;
+                } else if b == b'"' {
+                    stack.pop();
                     i += 1;
-                } else if c == quote {
-                    break;
+                } else if b == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    class[i + 1] = ByteClass::Literal;
+                    stack.push(Frame::Template { depth: 0 });
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
-        } else {
-            out.push(b);
-            i += 1;
+            Some(Frame::RawStr) => {
+                class[i] = ByteClass::Literal;
+                if bytes[i..].starts_with(b"\"\"\"") {
+                    // Closing delimiter plus any extra trailing quotes belong to the literal.
+                    while i < bytes.len() && bytes[i] == b'"' {
+                        class[i] = ByteClass::Literal;
+                        i += 1;
+                    }
+                    stack.pop();
+                } else if b == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    class[i + 1] = ByteClass::Literal;
+                    stack.push(Frame::Template { depth: 0 });
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
         }
     }
-    // Only ASCII bytes were replaced (by ASCII), and multi-byte sequences are
-    // either copied verbatim or fully blanked, so the result is valid UTF-8.
+    class
+}
+
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0xF0..=0xFF => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
+}
+
+/// Replace every byte whose class is in `blank` with a space, keeping line
+/// breaks.  Each blanked character becomes as many spaces as its UTF-8 length,
+/// so rows and byte columns are unchanged.
+fn blank_classes(source: &str, class: &[ByteClass], blank: &[ByteClass]) -> String {
+    let out: Vec<u8> = source
+        .bytes()
+        .zip(class)
+        .map(|(b, c)| {
+            if b != b'\n' && b != b'\r' && blank.contains(c) {
+                b' '
+            } else {
+                b
+            }
+        })
+        .collect();
+    // Literals and comments always cover whole UTF-8 sequences, so the result
+    // is valid UTF-8.
     String::from_utf8(out).unwrap_or_else(|_| source.to_string())
 }
 
+/// Replace every Kotlin comment with spaces so comments never reach semantic
+/// labels.  String and character literals (including nested template strings)
+/// are retained, so `//`, `/*` inside them are kept.
+#[cfg(test)]
+fn mask_comments(source: &str) -> String {
+    blank_classes(source, &classify(source), &[ByteClass::Comment])
+}
+
 fn lines(source: &str) -> Vec<SourceLine> {
-    source
+    let class = classify(source);
+    let masked = blank_classes(source, &class, &[ByteClass::Comment]);
+    let code = blank_classes(source, &class, &[ByteClass::Comment, ByteClass::Literal]);
+    masked
         .lines()
+        .zip(code.lines())
         .enumerate()
-        .map(|(i, text)| SourceLine {
+        .map(|(i, (text, code))| SourceLine {
             number: i as u32,
             text: text.to_string(),
             trimmed: text.trim().to_string(),
+            code: code.to_string(),
         })
         .collect()
 }
@@ -177,33 +297,21 @@ fn property_name(line: &str) -> String {
     )
 }
 
-fn brace_delta(text: &str) -> i32 {
-    brace_scan(text, 0).0
+fn brace_delta(code: &str) -> i32 {
+    brace_scan(code, 0).0
 }
 
-/// Scan `text` starting at brace depth `depth`, skipping braces inside string
-/// literals.  Returns the net brace delta and the byte offset of the first
-/// `}` that brings the running depth to zero or below, if any.
-fn brace_scan(text: &str, depth: i32) -> (i32, Option<usize>) {
+/// Scan the structural `code` view of a line (literals and comments already
+/// blanked) starting at brace depth `depth`.  Returns the net brace delta and
+/// the byte offset of the first `}` that brings the running depth to zero or
+/// below, if any.
+fn brace_scan(code: &str, depth: i32) -> (i32, Option<usize>) {
     let mut delta = 0;
     let mut close = None;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (idx, ch) in text.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => delta += 1,
-            '}' => {
+    for (idx, b) in code.bytes().enumerate() {
+        match b {
+            b'{' => delta += 1,
+            b'}' => {
                 delta -= 1;
                 if close.is_none() && depth + delta <= 0 {
                     close = Some(idx);
@@ -215,15 +323,22 @@ fn brace_scan(text: &str, depth: i32) -> (i32, Option<usize>) {
     (delta, close)
 }
 
+/// True when the structural content of `code` is only closing braces, e.g.
+/// `}` or `} }`: block structure, not a statement.
+fn only_closing_braces(code: &str) -> bool {
+    let t = code.trim();
+    !t.is_empty() && t.bytes().all(|b| b == b'}' || b.is_ascii_whitespace())
+}
+
 fn block_end(lines: &[SourceLine], start: usize) -> usize {
-    let mut depth = brace_delta(&lines[start].trimmed);
+    let mut depth = brace_delta(&lines[start].code);
     if depth <= 0 {
         return start;
     }
     let mut end = start;
     while end + 1 < lines.len() {
         end += 1;
-        depth += brace_delta(&lines[end].trimmed);
+        depth += brace_delta(&lines[end].code);
         if depth <= 0 {
             break;
         }
@@ -286,10 +401,10 @@ fn body_children(
     }
 
     let mut child_index = 1;
-    let mut depth = brace_delta(&header.trimmed);
+    let mut depth = brace_delta(&header.code);
     for line in block_lines.iter().take(end).skip(start + 1) {
-        depth += brace_delta(&line.trimmed);
-        if line.trimmed.is_empty() || line.trimmed == "}" {
+        depth += brace_delta(&line.code);
+        if line.trimmed.is_empty() || only_closing_braces(&line.code) {
             continue;
         }
         children.push(leaf(
@@ -305,16 +420,18 @@ fn body_children(
     // (`  return 1 }`) and declaration-level tokens after it (`} ; foo()`).
     // Slice it at the closing brace instead of dropping the whole row.
     let last = &block_lines[end];
-    let (before, after) = match brace_scan(&last.text, depth).1 {
-        Some(close) => (
-            (0, &last.text[..close]),
-            (close + 1, &last.text[close + 1..]),
-        ),
-        None => ((0, last.text.as_str()), (last.text.len(), "")),
+    // `close` indexes a structural `}` (ASCII, in code), so it is a char
+    // boundary in both views.
+    let (before, after) = match brace_scan(&last.code, depth).1 {
+        Some(close) => ((0, close), (close + 1, last.text.len())),
+        None => ((0, last.text.len()), (last.text.len(), last.text.len())),
     };
-    for (offset, segment) in [before, after] {
+    for (offset, to) in [before, after] {
+        let segment = &last.text[offset..to];
         let label = segment.trim();
-        if label.is_empty() {
+        // Skip blank segments and purely structural closing braces
+        // (`  } }`), matching closing braces on their own rows.
+        if label.is_empty() || only_closing_braces(&last.code[offset..to]) {
             continue;
         }
         let lead = segment.len() - segment.trim_start().len();
@@ -363,8 +480,7 @@ fn declaration_node(
 }
 
 fn parse_source(source: &str) -> SemanticNode {
-    let masked = mask_comments(source);
-    let source_lines = lines(&masked);
+    let source_lines = lines(source);
     let mut children = Vec::new();
     let mut i = 0usize;
     let mut child_index = 0usize;
@@ -734,6 +850,117 @@ mod tests {
             payload("fun s(): String = \"a // b\"\n"),
             payload("fun s(): String = \"a // c\"\n")
         );
+    }
+
+    // ---- PR #6 review: nested string literals inside templates ----
+
+    #[test]
+    fn nested_string_in_template_keeps_outer_string_open() {
+        // `"${"http://a"}"`: the inner quote must not close the outer string,
+        // so `//a` is string content, not a line comment.
+        let a = "fun f() = \"${\"http://a\"}\"\n";
+        let b = "fun f() = \"${\"http://b\"}\"\n";
+        assert_eq!(mask_comments(a), a);
+        assert_ne!(payload(a), payload(b));
+        let a = "fun f(m: Map<String, String>) = \"a ${m[\"k\"]} // b\"\n";
+        assert_eq!(mask_comments(a), a);
+        // A real comment after the template string is still trivia.
+        assert_eq!(
+            mask_comments("val s = \"${\"x\"}\" // c\n"),
+            "val s = \"${\"x\"}\"     \n"
+        );
+    }
+
+    #[test]
+    fn nested_braces_and_strings_inside_template() {
+        let a = "val s = \"${listOf(1).map { \"}\" + \"/*\" }.size} // x\"\n";
+        assert_eq!(mask_comments(a), a);
+        // Deeper nesting: string in template in string in template.
+        let a = "val s = \"${\"${\"//\"}\"}\" // c\n";
+        assert_eq!(mask_comments(a), "val s = \"${\"${\"//\"}\"}\"     \n");
+    }
+
+    #[test]
+    fn raw_string_templates_and_escapes() {
+        let a = "val s = \"\"\"a ${\"\"\"//x\"\"\"} ${m[\"k\"]} // y\"\"\" // c\n";
+        assert_eq!(
+            mask_comments(a),
+            "val s = \"\"\"a ${\"\"\"//x\"\"\"} ${m[\"k\"]} // y\"\"\"     \n"
+        );
+        // Raw strings have no escapes; `\` before the closing quotes is content.
+        assert_eq!(
+            mask_comments("val s = \"\"\"\\\"\"\" // c\n"),
+            "val s = \"\"\"\\\"\"\"     \n"
+        );
+        // Escaped `\$` and `\"` do not open templates / close the string.
+        let a = "val s = \"\\${ \\\" // x\" // c\n";
+        assert_eq!(mask_comments(a), "val s = \"\\${ \\\" // x\"     \n");
+        // Character literals containing quotes.
+        let a = "val c = '\"' // c\nval d = '\\'' // d\n";
+        assert_eq!(mask_comments(a), "val c = '\"'     \nval d = '\\''     \n");
+    }
+
+    #[test]
+    fn braces_inside_template_strings_do_not_close_blocks() {
+        // `"${"}"}"` holds a `}` inside a nested string; the block must not end there.
+        let f = facts("fun f(): String {\n  val s = \"${\"}\"}\"\n  return s\n}\nfun g() = 1\n");
+        assert!(
+            f.iter()
+                .any(|x| x.0 == "return_statement" && x.1 == "return s"),
+            "{f:?}"
+        );
+        assert_eq!(
+            f.iter().filter(|x| x.0 == "function_declaration").count(),
+            2,
+            "{f:?}"
+        );
+        // Braces inside a multi-line raw string are not structural either.
+        let f =
+            facts("fun f(): String {\n  val s = \"\"\"\n}\n\"\"\"\n  return s\n}\nfun g() = 1\n");
+        let decl = f
+            .iter()
+            .find(|x| x.0 == "function_declaration" && x.1 == "f")
+            .unwrap();
+        assert_eq!(decl.4, 5, "{f:?}");
+        assert_eq!(
+            f.iter().filter(|x| x.0 == "function_declaration").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn closing_row_template_with_nested_string_is_retained() {
+        let o = payload("fun f(): String {\n  return \"${\"}\"}\" }\n");
+        let n = payload("fun f(): String {\n  return \"${\"{\"}\" }\n");
+        assert!(o.iter().any(|x| x.1 == "return \"${\"}\"}\""), "{o:?}");
+        assert_ne!(o, n);
+    }
+
+    // ---- PR #6 review: structural braces on the closing row ----
+
+    #[test]
+    fn joined_closing_braces_add_no_statement() {
+        let split = "class A {\n  fun f() {\n    println(1)\n  }\n}\n";
+        let joined = "class A {\n  fun f() {\n    println(1)\n  } }\n";
+        assert_eq!(payload(split), payload(joined));
+        assert!(!payload(joined).iter().any(|x| x.1 == "}"));
+        // A pure closing-brace row inside the body is structural too.
+        let split = "class A {\n  fun f() {\n    if (x) {\n      g()\n    }\n  }\n  val y = 1\n}\n";
+        let joined = "class A {\n  fun f() {\n    if (x) {\n      g()\n    } }\n  val y = 1\n}\n";
+        assert_eq!(payload(split), payload(joined));
+        // Closing-row body tokens are still retained alongside joined braces.
+        let p = payload("class A {\n  fun f() {\n    g() } }\n");
+        assert!(p.iter().any(|x| x.1 == "g() }"), "{p:?}");
+    }
+
+    #[test]
+    fn truncated_literals_and_templates_never_panic() {
+        let src = "class A {\n  val s = \"a ${m[\"k\"]} \\${ \\\" b\"\n  val r = \"\"\"x ${\"\"\"}\"\"\"} é \"\"\"\n  val c = '\\''\n  fun f() { g(\"${ {\"}\"} }\") } /* /* é */ */ }\n}\n";
+        for (end, _) in src.char_indices() {
+            let prefix = &src[..end];
+            assert_eq!(mask_comments(prefix).len(), prefix.len());
+            t::assert_valid_json(&process_impl(prefix), "truncated kotlin");
+        }
     }
 
     #[test]
